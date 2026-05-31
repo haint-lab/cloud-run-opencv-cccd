@@ -1,11 +1,12 @@
 import base64
+import io
 import os
 from typing import Optional
 
 import cv2
 import numpy as np
 from flask import Flask, jsonify, request
-from PIL import Image, ImageEnhance
+from PIL import Image, ImageEnhance, ImageOps
 
 
 app = Flask(__name__)
@@ -18,11 +19,13 @@ JPEG_QUALITY = 85
 
 def decode_image(image_b64: str) -> np.ndarray:
     raw = base64.b64decode(image_b64)
-    arr = np.frombuffer(raw, np.uint8)
-    image = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    if image is None:
+    try:
+        pil = Image.open(io.BytesIO(raw))
+        pil = ImageOps.exif_transpose(pil)
+        pil = pil.convert("RGB")
+        return cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
+    except Exception as exc:
         raise ValueError("Cannot decode image")
-    return image
 
 
 def encode_jpg(image: np.ndarray) -> str:
@@ -43,6 +46,15 @@ def order_points(points: np.ndarray) -> np.ndarray:
     diff = np.diff(pts, axis=1)
     ordered[1] = pts[np.argmin(diff)]
     ordered[3] = pts[np.argmax(diff)]
+
+    top_width = np.linalg.norm(ordered[1] - ordered[0])
+    right_height = np.linalg.norm(ordered[2] - ordered[1])
+
+    if top_width < right_height:
+        ordered = np.array(
+            [ordered[3], ordered[0], ordered[1], ordered[2]],
+            dtype="float32",
+        )
 
     return ordered
 
@@ -91,6 +103,11 @@ def find_card_quad(image: np.ndarray) -> Optional[np.ndarray]:
             score = contour_score(points, image_area)
             if score >= 0:
                 candidates.append((score, points))
+
+        rect = cv2.boxPoints(cv2.minAreaRect(contour)).astype("float32")
+        score = contour_score(rect, image_area)
+        if score >= 0:
+            candidates.append((score * 0.85, rect))
 
     if candidates:
         candidates.sort(key=lambda item: item[0], reverse=True)
