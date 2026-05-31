@@ -155,6 +155,7 @@ def add_contour_candidates(
     weight: float = 1.0,
 ) -> None:
     contours = sorted(contours, key=cv2.contourArea, reverse=True)
+    border_margin = max(3, int(np.sqrt(image_area) * 0.006))
 
     for contour in contours[:45]:
         if cv2.contourArea(contour) < image_area * 0.015:
@@ -169,11 +170,18 @@ def add_contour_candidates(
 
         if len(approx) == 4 and cv2.isContourConvex(approx):
             points = approx.reshape(4, 2).astype("float32")
+            if (
+                np.any(points[:, 0] <= border_margin)
+                or np.any(points[:, 1] <= border_margin)
+            ):
+                continue
             score = contour_score(points, image_area)
             if score >= 0:
                 candidates.append((score * 1.08 * weight, points))
 
         rect = cv2.boxPoints(cv2.minAreaRect(contour)).astype("float32")
+        if np.any(rect[:, 0] <= border_margin) or np.any(rect[:, 1] <= border_margin):
+            continue
         score = contour_score(rect, image_area)
         if score >= 0:
             candidates.append((score * weight, rect))
@@ -211,7 +219,7 @@ def add_card_content_candidates(
         if abs(aspect - CCCD_ASPECT) / CCCD_ASPECT > 0.38:
             continue
 
-        expanded = expand_quad(box, 1.10, w, h)
+        expanded = expand_quad(box, 1.045, w, h)
         score = contour_score(expanded, image_area)
         if score >= 0:
             candidates.append((score * weight + area / image_area * 4.0, expanded))
@@ -409,7 +417,9 @@ def cccd_content_score(image: np.ndarray) -> float:
 
     low_saturation = hsv[:, :, 1] < 24
     bright = hsv[:, :, 2] > 165
-    background_like = np.where(low_saturation & bright, 255, 0).astype("uint8")
+    dark_background = (hsv[:, :, 1] < 55) & (hsv[:, :, 2] < 80)
+    bright_background = low_saturation & bright
+    background_like = np.where(bright_background | dark_background, 255, 0).astype("uint8")
     side_bands = [
         background_like[int(h * 0.20) : int(h * 0.80), : int(w * 0.10)],
         background_like[int(h * 0.20) : int(h * 0.80), int(w * 0.90) :],
@@ -417,7 +427,7 @@ def cccd_content_score(image: np.ndarray) -> float:
         background_like[int(h * 0.90) :, int(w * 0.20) : int(w * 0.80)],
     ]
     for band in side_bands:
-        if cv2.countNonZero(band) / max(1, band.size) > 0.78:
+        if cv2.countNonZero(band) / max(1, band.size) > 0.58:
             return -1
 
     score = 0.0
