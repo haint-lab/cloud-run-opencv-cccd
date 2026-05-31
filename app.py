@@ -121,6 +121,8 @@ def find_card_quad(image: np.ndarray) -> Optional[np.ndarray]:
     edges = cv2.Canny(gray, 50, 150)
 
     candidates = []
+    kernel_small = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    kernel_big = cv2.getStructuringElement(cv2.MORPH_RECT, (35, 21))
 
     def add_candidates_from_contours(contours, weight=1.0):
         contours = sorted(contours, key=cv2.contourArea, reverse=True)
@@ -163,8 +165,6 @@ def find_card_quad(image: np.ndarray) -> Optional[np.ndarray]:
     bright_mask = cv2.inRange(value, 70, 255)
     card_mask = cv2.bitwise_and(color_mask, bright_mask)
 
-    kernel_small = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-    kernel_big = cv2.getStructuringElement(cv2.MORPH_RECT, (35, 21))
     card_mask = cv2.morphologyEx(card_mask, cv2.MORPH_OPEN, kernel_small, iterations=1)
     card_mask = cv2.morphologyEx(card_mask, cv2.MORPH_CLOSE, kernel_big, iterations=3)
     card_mask = cv2.dilate(card_mask, kernel_small, iterations=2)
