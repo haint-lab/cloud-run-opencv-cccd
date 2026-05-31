@@ -204,6 +204,38 @@ def add_card_content_candidates(
     contours = sorted(contours, key=cv2.contourArea, reverse=True)
     h, w = image.shape[:2]
 
+    points = cv2.findNonZero(mask)
+    if points is not None:
+        x, y, bw, bh = cv2.boundingRect(points)
+        pad_x = int(bw * 0.035)
+        pad_y = int(bh * 0.055)
+        x1 = max(0, x - pad_x)
+        y1 = max(0, y - pad_y)
+        x2 = min(w - 1, x + bw + pad_x)
+        y2 = min(h - 1, y + bh + pad_y)
+
+        box_w = x2 - x1
+        box_h = y2 - y1
+        current_aspect = box_w / max(1, box_h)
+        if current_aspect < CCCD_ASPECT:
+            target_w = int(box_h * CCCD_ASPECT)
+            extra = max(0, target_w - box_w)
+            x1 = max(0, x1 - extra // 2)
+            x2 = min(w - 1, x2 + extra - extra // 2)
+        else:
+            target_h = int(box_w / CCCD_ASPECT)
+            extra = max(0, target_h - box_h)
+            y1 = max(0, y1 - extra // 2)
+            y2 = min(h - 1, y2 + extra - extra // 2)
+
+        bbox_quad = np.array(
+            [[x1, y1], [x2, y1], [x2, y2], [x1, y2]],
+            dtype="float32",
+        )
+        score = contour_score(bbox_quad, image_area)
+        if score >= 0:
+            candidates.append((score * weight + 3.0, bbox_quad))
+
     for contour in contours[:5]:
         area = cv2.contourArea(contour)
         if area < image_area * 0.05 or area > image_area * 0.92:
@@ -419,15 +451,36 @@ def cccd_content_score(image: np.ndarray) -> float:
     bright = hsv[:, :, 2] > 165
     dark_background = (hsv[:, :, 1] < 55) & (hsv[:, :, 2] < 80)
     bright_background = low_saturation & bright
-    background_like = np.where(bright_background | dark_background, 255, 0).astype("uint8")
+    bright_background_u8 = np.where(bright_background, 255, 0).astype("uint8")
+    dark_background_u8 = np.where(dark_background, 255, 0).astype("uint8")
+    guard_color = cv2.bitwise_or(card_color, dark)
     side_bands = [
-        background_like[int(h * 0.20) : int(h * 0.80), : int(w * 0.10)],
-        background_like[int(h * 0.20) : int(h * 0.80), int(w * 0.90) :],
-        background_like[: int(h * 0.10), int(w * 0.20) : int(w * 0.80)],
-        background_like[int(h * 0.90) :, int(w * 0.20) : int(w * 0.80)],
+        (
+            bright_background_u8[int(h * 0.20) : int(h * 0.80), : int(w * 0.10)],
+            dark_background_u8[int(h * 0.20) : int(h * 0.80), : int(w * 0.10)],
+            guard_color[int(h * 0.20) : int(h * 0.80), : int(w * 0.10)],
+        ),
+        (
+            bright_background_u8[int(h * 0.20) : int(h * 0.80), int(w * 0.90) :],
+            dark_background_u8[int(h * 0.20) : int(h * 0.80), int(w * 0.90) :],
+            guard_color[int(h * 0.20) : int(h * 0.80), int(w * 0.90) :],
+        ),
+        (
+            bright_background_u8[: int(h * 0.10), int(w * 0.20) : int(w * 0.80)],
+            dark_background_u8[: int(h * 0.10), int(w * 0.20) : int(w * 0.80)],
+            guard_color[: int(h * 0.10), int(w * 0.20) : int(w * 0.80)],
+        ),
+        (
+            bright_background_u8[int(h * 0.90) :, int(w * 0.20) : int(w * 0.80)],
+            dark_background_u8[int(h * 0.90) :, int(w * 0.20) : int(w * 0.80)],
+            guard_color[int(h * 0.90) :, int(w * 0.20) : int(w * 0.80)],
+        ),
     ]
-    for band in side_bands:
-        if cv2.countNonZero(band) / max(1, band.size) > 0.58:
+    for bright_band, dark_band, guard_band in side_bands:
+        guard_density = cv2.countNonZero(guard_band) / max(1, guard_band.size)
+        bright_density = cv2.countNonZero(bright_band) / max(1, bright_band.size)
+        dark_density_band = cv2.countNonZero(dark_band) / max(1, dark_band.size)
+        if guard_density < 0.035 and (bright_density > 0.86 or dark_density_band > 0.70):
             return -1
 
     score = 0.0
