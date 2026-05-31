@@ -117,82 +117,73 @@ def find_card_quad(image: np.ndarray) -> Optional[np.ndarray]:
 
     hsv = cv2.cvtColor(resized, cv2.COLOR_BGR2HSV)
     gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
-    
-    # [TỐI ƯU 1] Thay Gaussian Blur bằng Bilateral Filter để giữ cạnh sắc nét của thẻ
-    gray = cv2.bilateralFilter(gray, 11, 17, 17)
-    edges = cv2.Canny(gray, 30, 120) 
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(gray, 50, 150)
 
     candidates = []
     kernel_small = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
     kernel_big = cv2.getStructuringElement(cv2.MORPH_RECT, (35, 21))
 
     def add_candidates_from_contours(contours, weight=1.0):
-        # [TỐI ƯU 4] Chỉ lấy 10 contour lớn nhất, bỏ qua nhiễu rác
-        contours = sorted(contours, key=cv2.contourArea, reverse=True)[:10]
+        contours = sorted(contours, key=cv2.contourArea, reverse=True)
 
-        for contour in contours:
+        for contour in contours[:30]:
             perimeter = cv2.arcLength(contour, True)
-            
-            # [TỐI ƯU 3] Quét nhiều độ sai số (epsilon) để ép góc bo tròn ra 4 điểm
-            for eps in [0.02, 0.03, 0.05]:
-                approx = cv2.approxPolyDP(contour, eps * perimeter, True)
-                if len(approx) == 4 and cv2.isContourConvex(approx):
-                    points = approx.reshape(4, 2).astype("float32")
-                    score = contour_score(points, image_area)
-                    if score >= 0:
-                        candidates.append((score * weight, points))
-                        break
+            approx = cv2.approxPolyDP(contour, 0.02 * perimeter, True)
+
+            if len(approx) == 4 and cv2.isContourConvex(approx):
+                points = approx.reshape(4, 2).astype("float32")
+                score = contour_score(points, image_area)
+                if score >= 0:
+                    candidates.append((score * weight, points))
 
             rect = cv2.boxPoints(cv2.minAreaRect(contour)).astype("float32")
             score = contour_score(rect, image_area)
             if score >= 0:
                 candidates.append((score * 0.85 * weight, rect))
 
-    # --- [TỐI ƯU 2] CƠ CHẾ EARLY EXIT ---
-    
-    # Method 1: normal border/edge detection (Nhanh nhất)
+    # Method 0: background subtraction from corner colors. This is useful when
+    # the card sits on a white sheet/table and the outer border is weak.
+    bg_mask = background_color_mask(resized)
+    bg_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (41, 25))
+    bg_mask = cv2.morphologyEx(bg_mask, cv2.MORPH_OPEN, kernel_small, iterations=1)
+    bg_mask = cv2.morphologyEx(bg_mask, cv2.MORPH_CLOSE, bg_kernel, iterations=4)
+    bg_mask = cv2.dilate(bg_mask, kernel_small, iterations=2)
+    contours, _ = cv2.findContours(bg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    add_candidates_from_contours(contours, weight=1.45)
+
+    # Method 1: normal border/edge detection. Works well when the card border
+    # contrasts with the background.
     contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     add_candidates_from_contours(contours, weight=1.0)
 
-    # Nếu bắt được viền xuất sắc, bỏ qua các bước tốn CPU bên dưới
-    if not candidates or max(c[0] for c in candidates) < 4.2:
-        # Method 0: background subtraction
-        bg_mask = background_color_mask(resized)
-        bg_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (41, 25))
-        bg_mask = cv2.morphologyEx(bg_mask, cv2.MORPH_OPEN, kernel_small, iterations=1)
-        bg_mask = cv2.morphologyEx(bg_mask, cv2.MORPH_CLOSE, bg_kernel, iterations=4)
-        bg_mask = cv2.dilate(bg_mask, kernel_small, iterations=2)
-        contours, _ = cv2.findContours(bg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        add_candidates_from_contours(contours, weight=1.45)
+    # Method 2: saturation mask. This helps when the card sits on a white
+    # background and the outer edge is weak, but the CCCD artwork/text is colored.
+    saturation = hsv[:, :, 1]
+    value = hsv[:, :, 2]
+    color_mask = cv2.inRange(saturation, 28, 255)
+    bright_mask = cv2.inRange(value, 70, 255)
+    card_mask = cv2.bitwise_and(color_mask, bright_mask)
 
-    if not candidates or max(c[0] for c in candidates) < 3.5:
-        # Method 2: saturation mask
-        saturation = hsv[:, :, 1]
-        value = hsv[:, :, 2]
-        color_mask = cv2.inRange(saturation, 28, 255)
-        bright_mask = cv2.inRange(value, 70, 255)
-        card_mask = cv2.bitwise_and(color_mask, bright_mask)
+    card_mask = cv2.morphologyEx(card_mask, cv2.MORPH_OPEN, kernel_small, iterations=1)
+    card_mask = cv2.morphologyEx(card_mask, cv2.MORPH_CLOSE, kernel_big, iterations=3)
+    card_mask = cv2.dilate(card_mask, kernel_small, iterations=2)
 
-        card_mask = cv2.morphologyEx(card_mask, cv2.MORPH_OPEN, kernel_small, iterations=1)
-        card_mask = cv2.morphologyEx(card_mask, cv2.MORPH_CLOSE, kernel_big, iterations=3)
-        card_mask = cv2.dilate(card_mask, kernel_small, iterations=2)
+    contours, _ = cv2.findContours(card_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    add_candidates_from_contours(contours, weight=1.2)
 
-        contours, _ = cv2.findContours(card_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        add_candidates_from_contours(contours, weight=1.2)
-
-    if not candidates or max(c[0] for c in candidates) < 3.0:
-        # Method 3: adaptive threshold
-        adaptive = cv2.adaptiveThreshold(
-            gray,
-            255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY_INV,
-            31,
-            5,
-        )
-        adaptive = cv2.morphologyEx(adaptive, cv2.MORPH_CLOSE, kernel_big, iterations=2)
-        contours, _ = cv2.findContours(adaptive, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        add_candidates_from_contours(contours, weight=0.9)
+    # Method 3: adaptive threshold for low-contrast photos.
+    adaptive = cv2.adaptiveThreshold(
+        gray,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        31,
+        5,
+    )
+    adaptive = cv2.morphologyEx(adaptive, cv2.MORPH_CLOSE, kernel_big, iterations=2)
+    contours, _ = cv2.findContours(adaptive, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    add_candidates_from_contours(contours, weight=0.9)
 
     if candidates:
         candidates.sort(key=lambda item: item[0], reverse=True)
