@@ -15,6 +15,8 @@ CCCD_ASPECT = 85.6 / 53.98
 OUTPUT_WIDTH = 1200
 OUTPUT_HEIGHT = round(OUTPUT_WIDTH / CCCD_ASPECT)
 JPEG_QUALITY = 85
+PREVIEW_WIDTH = 480
+PREVIEW_HEIGHT = round(PREVIEW_WIDTH / CCCD_ASPECT)
 
 
 def decode_image(image_b64: str) -> np.ndarray:
@@ -117,8 +119,8 @@ def background_color_mask(image: np.ndarray) -> np.ndarray:
 
     mask = np.zeros((h, w), dtype=np.uint8)
     diff_u8 = np.clip(diff, 0, 255).astype("uint8")
-    _, otsu = cv2.threshold(diff_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    mask[(diff > 18) | (otsu > 0)] = 255
+    threshold, _ = cv2.threshold(diff_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    mask[diff > max(24, threshold * 0.85)] = 255
     return mask
 
 
@@ -204,6 +206,60 @@ def rotate_points_to_original(
     return pts
 
 
+def warp_quad_preview(image: np.ndarray, quad: np.ndarray) -> np.ndarray:
+    src = order_points(quad)
+    dst = np.array(
+        [
+            [0, 0],
+            [PREVIEW_WIDTH - 1, 0],
+            [PREVIEW_WIDTH - 1, PREVIEW_HEIGHT - 1],
+            [0, PREVIEW_HEIGHT - 1],
+        ],
+        dtype="float32",
+    )
+    matrix = cv2.getPerspectiveTransform(src, dst)
+    return cv2.warpPerspective(image, matrix, (PREVIEW_WIDTH, PREVIEW_HEIGHT))
+
+
+def cccd_content_score(image: np.ndarray) -> float:
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+    h, w = gray.shape
+    inner = np.zeros_like(gray)
+    inner[int(h * 0.05) : int(h * 0.95), int(w * 0.05) : int(w * 0.95)] = 255
+
+    cyan = cv2.inRange(hsv, np.array([70, 18, 70]), np.array([105, 255, 255]))
+    yellow = cv2.inRange(hsv, np.array([14, 25, 80]), np.array([45, 255, 255]))
+    red1 = cv2.inRange(hsv, np.array([0, 45, 45]), np.array([14, 255, 255]))
+    red2 = cv2.inRange(hsv, np.array([163, 45, 45]), np.array([179, 255, 255]))
+    red = cv2.bitwise_or(red1, red2)
+    dark = cv2.inRange(gray, 0, 145)
+    edges = cv2.Canny(gray, 45, 140)
+
+    cyan_density = cv2.countNonZero(cv2.bitwise_and(cyan, inner)) / cv2.countNonZero(inner)
+    yellow_density = cv2.countNonZero(cv2.bitwise_and(yellow, inner)) / cv2.countNonZero(inner)
+    red_density = cv2.countNonZero(cv2.bitwise_and(red, inner)) / cv2.countNonZero(inner)
+    dark_density = cv2.countNonZero(cv2.bitwise_and(dark, inner)) / cv2.countNonZero(inner)
+    edge_density = cv2.countNonZero(cv2.bitwise_and(edges, inner)) / cv2.countNonZero(inner)
+
+    color_density = cyan_density + yellow_density
+    if color_density < 0.035 and red_density < 0.0015:
+        return -1
+    if dark_density < 0.012 or dark_density > 0.40:
+        return -1
+    if edge_density < 0.012:
+        return -1
+
+    score = 0.0
+    score += min(cyan_density, 0.45) * 10.0
+    score += min(yellow_density, 0.30) * 3.0
+    score += min(red_density, 0.08) * 20.0
+    score += min(dark_density, 0.16) * 10.0
+    score += min(edge_density, 0.18) * 6.0
+    return score
+
+
 def find_card_quad_single_orientation(image: np.ndarray) -> Optional[tuple[float, np.ndarray]]:
     resized, ratio = resize_for_detection(image)
     image_area = resized.shape[0] * resized.shape[1]
@@ -270,10 +326,18 @@ def find_card_quad_single_orientation(image: np.ndarray) -> Optional[tuple[float
     contours, _ = cv2.findContours(adaptive, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     add_contour_candidates(candidates, contours, image_area, weight=0.9)
 
-    if candidates:
-        candidates.sort(key=lambda item: item[0], reverse=True)
-        best = expand_quad(candidates[0][1], 1.03, resized.shape[1], resized.shape[0])
-        return candidates[0][0], best * ratio
+    verified_candidates = []
+    for geometry_score, points in candidates:
+        expanded = expand_quad(points, 1.03, resized.shape[1], resized.shape[0])
+        preview = warp_quad_preview(resized, expanded)
+        content_score = cccd_content_score(preview)
+        if content_score < 0:
+            continue
+        verified_candidates.append((geometry_score + content_score, expanded))
+
+    if verified_candidates:
+        verified_candidates.sort(key=lambda item: item[0], reverse=True)
+        return verified_candidates[0][0], verified_candidates[0][1] * ratio
 
     return None
 
