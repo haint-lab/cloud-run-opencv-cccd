@@ -179,6 +179,44 @@ def add_contour_candidates(
             candidates.append((score * weight, rect))
 
 
+def add_card_content_candidates(
+    candidates: list[tuple[float, np.ndarray]],
+    image: np.ndarray,
+    image_area: float,
+    weight: float = 1.0,
+) -> None:
+    mask = card_content_mask(image)
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (65, 39))
+    dilate_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (19, 13))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel, iterations=2)
+    mask = cv2.dilate(mask, dilate_kernel, iterations=1)
+    mask = keep_largest_components(mask, max_components=1)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)
+    h, w = image.shape[:2]
+
+    for contour in contours[:5]:
+        area = cv2.contourArea(contour)
+        if area < image_area * 0.05 or area > image_area * 0.92:
+            continue
+
+        rect = cv2.minAreaRect(cv2.convexHull(contour))
+        box = cv2.boxPoints(rect).astype("float32")
+        rect_width, rect_height = rect[1]
+        if rect_width <= 0 or rect_height <= 0:
+            continue
+
+        aspect = max(rect_width, rect_height) / min(rect_width, rect_height)
+        if abs(aspect - CCCD_ASPECT) / CCCD_ASPECT > 0.38:
+            continue
+
+        expanded = expand_quad(box, 1.10, w, h)
+        score = contour_score(expanded, image_area)
+        if score >= 0:
+            candidates.append((score * weight + area / image_area * 4.0, expanded))
+
+
 def rotate_points_to_original(
     points: np.ndarray,
     angle: int,
@@ -407,6 +445,11 @@ def find_card_quad_single_orientation(image: np.ndarray) -> Optional[tuple[float
     kernel_small = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
     kernel_medium = cv2.getStructuringElement(cv2.MORPH_RECT, (17, 17))
     kernel_big = cv2.getStructuringElement(cv2.MORPH_RECT, (47, 31))
+
+    # Method -1: CCCD content rectangle. This is the main path for vertical
+    # source photos after pre-rotation; it groups MRZ/fingerprints/chip/stamps
+    # and crops the full card instead of a text-heavy subregion.
+    add_card_content_candidates(candidates, resized, image_area, weight=1.8)
 
     # Method 0: background subtraction from corner colors. This is useful when
     # the card sits on a white sheet/table and rounded corners weaken the border.
