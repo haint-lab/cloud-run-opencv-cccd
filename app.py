@@ -206,6 +206,97 @@ def rotate_points_to_original(
     return pts
 
 
+def card_content_mask(image: np.ndarray) -> np.ndarray:
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+    cyan = cv2.inRange(hsv, np.array([70, 18, 65]), np.array([108, 255, 255]))
+    yellow = cv2.inRange(hsv, np.array([14, 25, 75]), np.array([45, 255, 255]))
+    red1 = cv2.inRange(hsv, np.array([0, 45, 45]), np.array([14, 255, 255]))
+    red2 = cv2.inRange(hsv, np.array([163, 45, 45]), np.array([179, 255, 255]))
+    red = cv2.bitwise_or(red1, red2)
+    dark = cv2.inRange(gray, 0, 115)
+
+    mask = cv2.bitwise_or(cyan, yellow)
+    mask = cv2.bitwise_or(mask, red)
+    mask = cv2.bitwise_or(mask, dark)
+    mask = cv2.morphologyEx(
+        mask,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
+        iterations=1,
+    )
+    mask = cv2.morphologyEx(
+        mask,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (41, 25)),
+        iterations=2,
+    )
+    return keep_largest_components(mask, max_components=2)
+
+
+def estimate_card_long_axis_angle(image: np.ndarray) -> Optional[float]:
+    resized, ratio = resize_for_detection(image, target_long_side=900)
+    mask = card_content_mask(resized)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+
+    image_area = resized.shape[0] * resized.shape[1]
+    best = None
+    for contour in sorted(contours, key=cv2.contourArea, reverse=True)[:8]:
+        area = cv2.contourArea(contour)
+        if area < image_area * 0.035:
+            continue
+
+        rect = cv2.minAreaRect(contour)
+        box = cv2.boxPoints(rect).astype("float32")
+        rect_area = max(1.0, rect[1][0] * rect[1][1])
+        extent = area / rect_area
+        width, height = rect[1]
+        if width <= 0 or height <= 0:
+            continue
+
+        aspect = max(width, height) / min(width, height)
+        if aspect < 1.15 or aspect > 2.35 or extent < 0.35:
+            continue
+
+        edge_vectors = []
+        for idx in range(4):
+            p1 = box[idx]
+            p2 = box[(idx + 1) % 4]
+            vector = p2 - p1
+            length = float(np.linalg.norm(vector))
+            edge_vectors.append((length, vector))
+
+        length, vector = max(edge_vectors, key=lambda item: item[0])
+        angle = float(np.degrees(np.arctan2(vector[1], vector[0])))
+        while angle <= -90:
+            angle += 180
+        while angle > 90:
+            angle -= 180
+
+        score = area * extent
+        if best is None or score > best[0]:
+            best = (score, angle)
+
+    if best is None:
+        return None
+
+    return best[1]
+
+
+def normalize_source_for_detection(image: np.ndarray) -> tuple[np.ndarray, int]:
+    angle = estimate_card_long_axis_angle(image)
+    if angle is None:
+        return image, 0
+
+    if abs(angle) > 45:
+        return cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE), 90
+
+    return image, 0
+
+
 def warp_quad_preview(image: np.ndarray, quad: np.ndarray) -> np.ndarray:
     src = order_points(quad)
     dst = np.array(
@@ -379,24 +470,11 @@ def find_card_quad_single_orientation(image: np.ndarray) -> Optional[tuple[float
 
 
 def find_card_quad(image: np.ndarray) -> Optional[np.ndarray]:
-    h, w = image.shape[:2]
-    candidates = []
-
-    for angle in (0, 90, 180, 270):
-        rotated = rotate_image(image, angle)
-        result = find_card_quad_single_orientation(rotated)
-        if result is None:
-            continue
-
-        score, quad = result
-        mapped = rotate_points_to_original(quad, angle, w, h)
-        candidates.append((score, mapped))
-
-    if not candidates:
+    result = find_card_quad_single_orientation(image)
+    if result is None:
         return None
 
-    candidates.sort(key=lambda item: item[0], reverse=True)
-    return candidates[0][1]
+    return result[1]
 
 
 def warp_card(image: np.ndarray, quad: np.ndarray) -> np.ndarray:
@@ -570,7 +648,8 @@ def crop_cccd():
             return jsonify({"ok": False, "error": "Missing imageBase64"}), 400
 
         image = decode_image(image_b64)
-        quad = find_card_quad(image)
+        detection_image, pre_rotate_angle = normalize_source_for_detection(image)
+        quad = find_card_quad(detection_image)
         if quad is None:
             return jsonify(
                 {
@@ -579,7 +658,7 @@ def crop_cccd():
                 }
             ), 422
 
-        cropped = warp_card(image, quad)
+        cropped = warp_card(detection_image, quad)
         cropped, rotate_angle, orientation_score = normalize_card_orientation(cropped)
         enhanced = enhance_image(cropped)
 
@@ -588,6 +667,7 @@ def crop_cccd():
                 "ok": True,
                 "method": "opencv_quad",
                 "format": "jpg",
+                "preRotateAngle": pre_rotate_angle,
                 "rotateAngle": rotate_angle,
                 "orientationScore": round(float(orientation_score), 4),
                 "width": OUTPUT_WIDTH,
