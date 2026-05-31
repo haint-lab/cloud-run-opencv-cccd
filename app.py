@@ -12,14 +12,19 @@ from PIL import Image, ImageEnhance, ImageOps
 app = Flask(__name__)
 
 CCCD_ASPECT = 85.6 / 53.98
+
 OUTPUT_WIDTH = int(os.environ.get("OUTPUT_WIDTH", "1800"))
 OUTPUT_HEIGHT = round(OUTPUT_WIDTH / CCCD_ASPECT)
 JPEG_QUALITY = int(os.environ.get("JPEG_QUALITY", "88"))
 
-EARLY_EXIT_SCORE = float(os.environ.get("EARLY_EXIT_SCORE", "5.0"))
-MIN_ACCEPT_SCORE = float(os.environ.get("MIN_ACCEPT_SCORE", "0.35"))
+EARLY_EXIT_SCORE = float(os.environ.get("EARLY_EXIT_SCORE", "4.8"))
+MIN_ACCEPT_SCORE = float(os.environ.get("MIN_ACCEPT_SCORE", "0.8"))
+
+# Crop sát hơn bản trước
 EXPAND_FACTOR = float(os.environ.get("EXPAND_FACTOR", "1.03"))
-ENABLE_FALLBACK_RESIZE = os.environ.get("ENABLE_FALLBACK_RESIZE", "true").lower() == "true"
+
+# Nên để false để không lưu ảnh gốc resize vào cột ảnh chuẩn
+ENABLE_FALLBACK_RESIZE = os.environ.get("ENABLE_FALLBACK_RESIZE", "false").lower() == "true"
 
 
 def decode_image(image_b64: str) -> np.ndarray:
@@ -27,7 +32,6 @@ def decode_image(image_b64: str) -> np.ndarray:
         image_b64 = image_b64.split(",", 1)[1]
 
     raw = base64.b64decode(image_b64)
-
     try:
         pil = Image.open(io.BytesIO(raw))
         pil = ImageOps.exif_transpose(pil)
@@ -38,14 +42,9 @@ def decode_image(image_b64: str) -> np.ndarray:
 
 
 def encode_jpg(image: np.ndarray) -> str:
-    ok, buf = cv2.imencode(
-        ".jpg",
-        image,
-        [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY],
-    )
+    ok, buf = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
     if not ok:
         raise ValueError("Cannot encode output JPG")
-
     return base64.b64encode(buf.tobytes()).decode("ascii")
 
 
@@ -99,7 +98,6 @@ def contour_score(points: np.ndarray, image_area: float) -> float:
 
     rect = cv2.minAreaRect(points.astype("float32"))
     width, height = rect[1]
-
     if width <= 0 or height <= 0:
         return -1
 
@@ -107,10 +105,10 @@ def contour_score(points: np.ndarray, image_area: float) -> float:
     aspect_error = abs(aspect - CCCD_ASPECT) / CCCD_ASPECT
     area_ratio = area / image_area
 
-    if area_ratio < 0.045 or area_ratio > 0.97:
+    if area_ratio < 0.06 or area_ratio > 0.96:
         return -1
 
-    if aspect_error > 0.45:
+    if aspect_error > 0.42:
         return -1
 
     return area_ratio * 5.0 - aspect_error * 2.2
@@ -120,10 +118,8 @@ def expand_quad(points: np.ndarray, factor: float, width: int, height: int) -> n
     pts = points.reshape(4, 2).astype("float32")
     center = np.mean(pts, axis=0)
     expanded = center + (pts - center) * factor
-
     expanded[:, 0] = np.clip(expanded[:, 0], 0, width - 1)
     expanded[:, 1] = np.clip(expanded[:, 1], 0, height - 1)
-
     return expanded.astype("float32")
 
 
@@ -145,14 +141,12 @@ def background_color_mask(image: np.ndarray) -> np.ndarray:
 
     mask = np.zeros((h, w), dtype=np.uint8)
     mask[diff > 28] = 255
-
     return mask
 
 
 def best_candidate(candidates):
     if not candidates:
         return None
-
     candidates.sort(key=lambda item: item[0], reverse=True)
     return candidates[0]
 
@@ -177,25 +171,20 @@ def add_candidates_from_contours(
             if len(approx) == 4 and cv2.isContourConvex(approx):
                 points = approx.reshape(4, 2).astype("float32")
                 score = contour_score(points, image_area)
-
                 if score >= 0:
                     candidates.append((score * weight, points))
                     break
 
         rect = cv2.boxPoints(cv2.minAreaRect(contour)).astype("float32")
         score = contour_score(rect, image_area)
-
         if score >= 0:
             candidates.append((score * 0.85 * weight, rect))
 
 
 def find_card_quad(image: np.ndarray) -> Tuple[Optional[np.ndarray], float, str]:
     h0, w0 = image.shape[:2]
-
-    target_h = 700.0
-    ratio = h0 / target_h
-    resized = cv2.resize(image, (int(w0 / ratio), int(target_h)))
-
+    ratio = h0 / 700.0
+    resized = cv2.resize(image, (int(w0 / ratio), 700))
     rh, rw = resized.shape[:2]
     image_area = rh * rw
 
@@ -203,6 +192,7 @@ def find_card_quad(image: np.ndarray) -> Tuple[Optional[np.ndarray], float, str]
 
     hsv = cv2.cvtColor(resized, cv2.COLOR_BGR2HSV)
     gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+
     gray = cv2.bilateralFilter(gray, 9, 75, 75)
 
     kernel_small = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
@@ -215,7 +205,7 @@ def find_card_quad(image: np.ndarray) -> Tuple[Optional[np.ndarray], float, str]
             return quad * ratio, float(best[0]), method_name
         return None
 
-    edges = cv2.Canny(gray, 30, 120)
+    edges = cv2.Canny(gray, 35, 120)
     edges = cv2.dilate(edges, kernel_small, iterations=1)
     edges = cv2.erode(edges, kernel_small, iterations=1)
 
@@ -243,8 +233,8 @@ def find_card_quad(image: np.ndarray) -> Tuple[Optional[np.ndarray], float, str]
     saturation = hsv[:, :, 1]
     value = hsv[:, :, 2]
 
-    color_mask = cv2.inRange(saturation, 24, 255)
-    bright_mask = cv2.inRange(value, 60, 255)
+    color_mask = cv2.inRange(saturation, 28, 255)
+    bright_mask = cv2.inRange(value, 70, 255)
     card_mask = cv2.bitwise_and(color_mask, bright_mask)
 
     card_mask = cv2.morphologyEx(card_mask, cv2.MORPH_OPEN, kernel_small, iterations=1)
@@ -273,7 +263,6 @@ def find_card_quad(image: np.ndarray) -> Tuple[Optional[np.ndarray], float, str]
     add_candidates_from_contours(contours, candidates, image_area, weight=0.9, limit=15)
 
     best = best_candidate(candidates)
-
     if best and best[0] >= MIN_ACCEPT_SCORE:
         quad = expand_quad(best[1], EXPAND_FACTOR, rw, rh)
         return quad * ratio, float(best[0]), "opencv_best_candidate"
@@ -286,7 +275,7 @@ def find_card_quad_any_rotation(
 ) -> Tuple[Optional[np.ndarray], float, str, np.ndarray, int]:
     results = []
 
-    # Trước crop: được thử đủ 4 hướng
+    # Trước crop: thử 4 hướng để bắt cạnh
     for angle in (0, 90, 180, 270):
         rotated = rotate_image(image, angle)
         quad, score, method = find_card_quad(rotated)
@@ -298,7 +287,6 @@ def find_card_quad_any_rotation(
         return None, -1.0, "not_found", image, 0
 
     results.sort(key=lambda item: item[0], reverse=True)
-
     score, angle, rotated_image, quad, method = results[0]
 
     return quad, float(score), f"{method}_source_rot{angle}", rotated_image, angle
@@ -318,13 +306,7 @@ def warp_card(image: np.ndarray, quad: np.ndarray) -> np.ndarray:
     )
 
     matrix = cv2.getPerspectiveTransform(src, dst)
-
-    return cv2.warpPerspective(
-        image,
-        matrix,
-        (OUTPUT_WIDTH, OUTPUT_HEIGHT),
-        flags=cv2.INTER_CUBIC,
-    )
+    return cv2.warpPerspective(image, matrix, (OUTPUT_WIDTH, OUTPUT_HEIGHT))
 
 
 def qr_position_score(image: np.ndarray) -> float:
@@ -335,24 +317,48 @@ def qr_position_score(image: np.ndarray) -> float:
         return 0.0
 
     pts = points.reshape(-1, 2)
-
     center_x = float(np.mean(pts[:, 0])) / image.shape[1]
     center_y = float(np.mean(pts[:, 1])) / image.shape[0]
 
-    if center_x > 0.55 and center_y < 0.45:
-        return 14.0
+    # Mặt trước đúng chiều: QR ở góc trên phải
+    if center_x > 0.50 and center_y < 0.50:
+        return 10.0
 
-    if center_x < 0.45 and center_y > 0.55:
-        return -10.0
+    # QR ở góc dưới trái thường là ngược 180
+    if center_x < 0.50 and center_y > 0.50:
+        return -6.0
 
-    return -2.0
+    return -1.0
+
+
+def bottom_text_score(image: np.ndarray) -> float:
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    dark = cv2.inRange(gray, 0, 105)
+
+    h, _ = dark.shape
+    top = dark[: int(h * 0.35), :]
+    bottom = dark[int(h * 0.55):, :]
+
+    top_density = cv2.countNonZero(top) / max(1, top.size)
+    bottom_density = cv2.countNonZero(bottom) / max(1, bottom.size)
+
+    return (bottom_density - top_density) * 30.0
 
 
 def red_emblem_score(image: np.ndarray) -> float:
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
 
-    red1 = cv2.inRange(hsv, np.array([0, 70, 60]), np.array([12, 255, 255]))
-    red2 = cv2.inRange(hsv, np.array([165, 70, 60]), np.array([179, 255, 255]))
+    red1 = cv2.inRange(
+        hsv,
+        np.array([0, 70, 60]),
+        np.array([12, 255, 255]),
+    )
+    red2 = cv2.inRange(
+        hsv,
+        np.array([165, 70, 60]),
+        np.array([179, 255, 255]),
+    )
+
     red = cv2.bitwise_or(red1, red2)
 
     h, w = red.shape
@@ -368,26 +374,10 @@ def red_emblem_score(image: np.ndarray) -> float:
     return (top_left_density * 30.0) - (bottom_right_density * 20.0) - (other_density * 8.0)
 
 
-def bottom_text_score(image: np.ndarray) -> float:
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    dark = cv2.inRange(gray, 0, 115)
-
-    h, _ = dark.shape
-
-    top = dark[: int(h * 0.35), :]
-    bottom = dark[int(h * 0.55):, :]
-
-    top_density = cv2.countNonZero(top) / max(1, top.size)
-    bottom_density = cv2.countNonZero(bottom) / max(1, bottom.size)
-
-    return (bottom_density - top_density) * 25.0
-
-
 def mrz_score(image: np.ndarray) -> float:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
     h, _ = gray.shape
-
     top = gray[: int(h * 0.45), :]
     bottom = gray[int(h * 0.52):, :]
 
@@ -397,6 +387,7 @@ def mrz_score(image: np.ndarray) -> float:
     top_density = cv2.countNonZero(top_dark) / max(1, top_dark.size)
     bottom_density = cv2.countNonZero(bottom_dark) / max(1, bottom_dark.size)
 
+    # Mặt sau đúng chiều: MRZ nằm phía dưới
     return (bottom_density - top_density) * 100.0
 
 
@@ -420,33 +411,34 @@ def normalize_card_orientation(
 
     candidates = []
 
-    # Sau khi warp, ảnh CCCD đã là khung ngang.
-    # Chỉ xét 0 và 180. Tuyệt đối không xoay 90/270 ở bước này.
+    # Sau khi crop/warp, ảnh đã là khung ngang.
+    # Chỉ xét 0 và 180. Không xoay 90/270 nữa.
     for angle in (0, 180):
         rotated = rotate_image(image, angle)
 
-        if side == "back":
+        if side == "front":
+            score = (
+                qr_position_score(rotated)
+                + red_emblem_score(rotated)
+                + bottom_text_score(rotated)
+            )
+
+        elif side == "back":
             score = mrz_score(rotated)
 
-        elif side == "front":
-            score = (
-                qr_position_score(rotated)
-                + red_emblem_score(rotated)
-                + bottom_text_score(rotated)
-            )
-
         else:
-            score = (
+            front_score = (
                 qr_position_score(rotated)
                 + red_emblem_score(rotated)
                 + bottom_text_score(rotated)
-                + mrz_score(rotated) * 0.4
             )
+            back_score = mrz_score(rotated)
+
+            score = max(front_score, back_score)
 
         candidates.append((score, angle, rotated))
 
     candidates.sort(key=lambda item: item[0], reverse=True)
-
     best_score, best_angle, best_image = candidates[0]
 
     return best_image, best_angle, float(best_score), side
@@ -454,10 +446,10 @@ def normalize_card_orientation(
 
 def enhance_image(image: np.ndarray) -> np.ndarray:
     rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-
     pil = Image.fromarray(rgb)
+
     pil = ImageEnhance.Contrast(pil).enhance(1.06)
-    pil = ImageEnhance.Sharpness(pil).enhance(1.10)
+    pil = ImageEnhance.Sharpness(pil).enhance(1.12)
     pil = ImageEnhance.Color(pil).enhance(1.02)
 
     return cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
@@ -476,7 +468,6 @@ def blur_score(image: np.ndarray) -> float:
 
 def resize_to_output_landscape(image: np.ndarray) -> np.ndarray:
     image = ensure_landscape(image)
-
     return cv2.resize(
         image,
         (OUTPUT_WIDTH, OUTPUT_HEIGHT),
@@ -493,19 +484,19 @@ def health():
 def crop_cccd():
     try:
         token = os.environ.get("CROP_API_TOKEN", "")
-
         if token:
             auth = request.headers.get("Authorization", "")
             if auth != f"Bearer {token}":
                 return jsonify({"ok": False, "error": "Unauthorized"}), 401
 
         body = request.get_json(silent=True) or {}
-
         image_b64 = body.get("imageBase64")
         filename = (
             body.get("fileName")
             or body.get("filename")
             or body.get("name")
+            or body.get("path")
+            or body.get("imagePath")
             or ""
         )
 
