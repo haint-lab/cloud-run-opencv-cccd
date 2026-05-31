@@ -235,12 +235,12 @@ def card_content_mask(image: np.ndarray) -> np.ndarray:
     return keep_largest_components(mask, max_components=2)
 
 
-def estimate_card_long_axis_angle(image: np.ndarray) -> Optional[float]:
-    resized, ratio = resize_for_detection(image, target_long_side=900)
+def detect_card_source_orientation(image: np.ndarray) -> tuple[str, float]:
+    resized, _ = resize_for_detection(image, target_long_side=900)
     mask = card_content_mask(resized)
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
-        return None
+        return "unknown", 0.0
 
     image_area = resized.shape[0] * resized.shape[1]
     best = None
@@ -249,7 +249,8 @@ def estimate_card_long_axis_angle(image: np.ndarray) -> Optional[float]:
         if area < image_area * 0.035:
             continue
 
-        rect = cv2.minAreaRect(contour)
+        hull = cv2.convexHull(contour)
+        rect = cv2.minAreaRect(hull)
         box = cv2.boxPoints(rect).astype("float32")
         rect_area = max(1.0, rect[1][0] * rect[1][1])
         extent = area / rect_area
@@ -261,6 +262,7 @@ def estimate_card_long_axis_angle(image: np.ndarray) -> Optional[float]:
         if aspect < 1.15 or aspect > 2.35 or extent < 0.35:
             continue
 
+        x, y, bw, bh = cv2.boundingRect(hull)
         edge_vectors = []
         for idx in range(4):
             p1 = box[idx]
@@ -276,25 +278,28 @@ def estimate_card_long_axis_angle(image: np.ndarray) -> Optional[float]:
         while angle > 90:
             angle -= 180
 
-        score = area * extent
+        bbox_orientation = "portrait" if bh > bw * 1.08 else "landscape"
+        axis_orientation = "portrait" if abs(angle) > 45 else "landscape"
+        orientation = bbox_orientation
+        if 0.88 <= (bh / max(1, bw)) <= 1.12:
+            orientation = axis_orientation
+
+        score = area * extent * aspect
         if best is None or score > best[0]:
-            best = (score, angle)
+            best = (score, orientation, angle)
 
     if best is None:
-        return None
+        return "unknown", 0.0
 
-    return best[1]
+    return best[1], best[2]
 
 
-def normalize_source_for_detection(image: np.ndarray) -> tuple[np.ndarray, int]:
-    angle = estimate_card_long_axis_angle(image)
-    if angle is None:
-        return image, 0
+def normalize_source_for_detection(image: np.ndarray) -> tuple[np.ndarray, int, str]:
+    orientation, _ = detect_card_source_orientation(image)
+    if orientation == "portrait":
+        return cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE), 90, orientation
 
-    if abs(angle) > 45:
-        return cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE), 90
-
-    return image, 0
+    return image, 0, orientation
 
 
 def warp_quad_preview(image: np.ndarray, quad: np.ndarray) -> np.ndarray:
@@ -648,7 +653,7 @@ def crop_cccd():
             return jsonify({"ok": False, "error": "Missing imageBase64"}), 400
 
         image = decode_image(image_b64)
-        detection_image, pre_rotate_angle = normalize_source_for_detection(image)
+        detection_image, pre_rotate_angle, source_orientation = normalize_source_for_detection(image)
         quad = find_card_quad(detection_image)
         if quad is None:
             return jsonify(
@@ -667,6 +672,7 @@ def crop_cccd():
                 "ok": True,
                 "method": "opencv_quad",
                 "format": "jpg",
+                "sourceOrientation": source_orientation,
                 "preRotateAngle": pre_rotate_angle,
                 "rotateAngle": rotate_angle,
                 "orientationScore": round(float(orientation_score), 4),
