@@ -81,6 +81,35 @@ def contour_score(points: np.ndarray, image_area: float) -> float:
     return area_ratio * 5.0 - aspect_error * 2.0
 
 
+def expand_quad(points: np.ndarray, factor: float, width: int, height: int) -> np.ndarray:
+    pts = points.reshape(4, 2).astype("float32")
+    center = np.mean(pts, axis=0)
+    expanded = center + (pts - center) * factor
+    expanded[:, 0] = np.clip(expanded[:, 0], 0, width - 1)
+    expanded[:, 1] = np.clip(expanded[:, 1], 0, height - 1)
+    return expanded.astype("float32")
+
+
+def background_color_mask(image: np.ndarray) -> np.ndarray:
+    h, w = image.shape[:2]
+    patch = max(12, min(h, w) // 25)
+
+    samples = np.vstack(
+        [
+            image[:patch, :patch].reshape(-1, 3),
+            image[:patch, w - patch :].reshape(-1, 3),
+            image[h - patch :, :patch].reshape(-1, 3),
+            image[h - patch :, w - patch :].reshape(-1, 3),
+        ]
+    )
+    background = np.median(samples, axis=0).astype("float32")
+    diff = np.linalg.norm(image.astype("float32") - background, axis=2)
+
+    mask = np.zeros((h, w), dtype=np.uint8)
+    mask[diff > 28] = 255
+    return mask
+
+
 def find_card_quad(image: np.ndarray) -> Optional[np.ndarray]:
     ratio = image.shape[0] / 700.0
     resized = cv2.resize(image, (int(image.shape[1] / ratio), 700))
@@ -110,6 +139,16 @@ def find_card_quad(image: np.ndarray) -> Optional[np.ndarray]:
             score = contour_score(rect, image_area)
             if score >= 0:
                 candidates.append((score * 0.85 * weight, rect))
+
+    # Method 0: background subtraction from corner colors. This is useful when
+    # the card sits on a white sheet/table and the outer border is weak.
+    bg_mask = background_color_mask(resized)
+    bg_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (41, 25))
+    bg_mask = cv2.morphologyEx(bg_mask, cv2.MORPH_OPEN, kernel_small, iterations=1)
+    bg_mask = cv2.morphologyEx(bg_mask, cv2.MORPH_CLOSE, bg_kernel, iterations=4)
+    bg_mask = cv2.dilate(bg_mask, kernel_small, iterations=2)
+    contours, _ = cv2.findContours(bg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    add_candidates_from_contours(contours, weight=1.45)
 
     # Method 1: normal border/edge detection. Works well when the card border
     # contrasts with the background.
@@ -148,7 +187,8 @@ def find_card_quad(image: np.ndarray) -> Optional[np.ndarray]:
 
     if candidates:
         candidates.sort(key=lambda item: item[0], reverse=True)
-        return candidates[0][1] * ratio
+        best = expand_quad(candidates[0][1], 1.03, resized.shape[1], resized.shape[0])
+        return best * ratio
 
     return None
 
