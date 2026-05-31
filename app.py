@@ -251,12 +251,48 @@ def cccd_content_score(image: np.ndarray) -> float:
     if edge_density < 0.012:
         return -1
 
+    card_color = cv2.bitwise_or(cyan, yellow)
+    card_color = cv2.bitwise_or(card_color, red)
+    card_color = cv2.morphologyEx(
+        card_color,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (17, 17)),
+        iterations=2,
+    )
+    color_points = cv2.findNonZero(cv2.bitwise_and(card_color, inner))
+    if color_points is None:
+        return -1
+
+    x, y, bw, bh = cv2.boundingRect(color_points)
+    color_width_ratio = bw / w
+    color_height_ratio = bh / h
+    if x > w * 0.22 or (x + bw) < w * 0.78:
+        return -1
+    if y > h * 0.18 or (y + bh) < h * 0.82:
+        return -1
+    if color_width_ratio < 0.62 or color_height_ratio < 0.58:
+        return -1
+
+    low_saturation = hsv[:, :, 1] < 24
+    bright = hsv[:, :, 2] > 165
+    background_like = np.where(low_saturation & bright, 255, 0).astype("uint8")
+    side_bands = [
+        background_like[int(h * 0.20) : int(h * 0.80), : int(w * 0.10)],
+        background_like[int(h * 0.20) : int(h * 0.80), int(w * 0.90) :],
+        background_like[: int(h * 0.10), int(w * 0.20) : int(w * 0.80)],
+        background_like[int(h * 0.90) :, int(w * 0.20) : int(w * 0.80)],
+    ]
+    for band in side_bands:
+        if cv2.countNonZero(band) / max(1, band.size) > 0.78:
+            return -1
+
     score = 0.0
     score += min(cyan_density, 0.45) * 10.0
     score += min(yellow_density, 0.30) * 3.0
     score += min(red_density, 0.08) * 20.0
     score += min(dark_density, 0.16) * 10.0
     score += min(edge_density, 0.18) * 6.0
+    score += color_width_ratio * 2.0 + color_height_ratio * 2.0
     return score
 
 
@@ -328,7 +364,7 @@ def find_card_quad_single_orientation(image: np.ndarray) -> Optional[tuple[float
 
     verified_candidates = []
     for geometry_score, points in candidates:
-        expanded = expand_quad(points, 1.03, resized.shape[1], resized.shape[0])
+        expanded = expand_quad(points, 1.015, resized.shape[1], resized.shape[0])
         preview = warp_quad_preview(resized, expanded)
         content_score = cccd_content_score(preview)
         if content_score < 0:
