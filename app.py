@@ -12,14 +12,13 @@ from PIL import Image, ImageEnhance, ImageOps
 app = Flask(__name__)
 
 CCCD_ASPECT = 85.6 / 53.98
-
 OUTPUT_WIDTH = int(os.environ.get("OUTPUT_WIDTH", "1800"))
 OUTPUT_HEIGHT = round(OUTPUT_WIDTH / CCCD_ASPECT)
 JPEG_QUALITY = int(os.environ.get("JPEG_QUALITY", "88"))
 
-EARLY_EXIT_SCORE = float(os.environ.get("EARLY_EXIT_SCORE", "5.2"))
+EARLY_EXIT_SCORE = float(os.environ.get("EARLY_EXIT_SCORE", "5.0"))
 MIN_ACCEPT_SCORE = float(os.environ.get("MIN_ACCEPT_SCORE", "0.35"))
-EXPAND_FACTOR = float(os.environ.get("EXPAND_FACTOR", "1.015"))
+EXPAND_FACTOR = float(os.environ.get("EXPAND_FACTOR", "1.03"))
 ENABLE_FALLBACK_RESIZE = os.environ.get("ENABLE_FALLBACK_RESIZE", "true").lower() == "true"
 
 
@@ -204,7 +203,6 @@ def find_card_quad(image: np.ndarray) -> Tuple[Optional[np.ndarray], float, str]
 
     hsv = cv2.cvtColor(resized, cv2.COLOR_BGR2HSV)
     gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
-
     gray = cv2.bilateralFilter(gray, 9, 75, 75)
 
     kernel_small = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
@@ -217,26 +215,17 @@ def find_card_quad(image: np.ndarray) -> Tuple[Optional[np.ndarray], float, str]
             return quad * ratio, float(best[0]), method_name
         return None
 
-    # Method 1: Edge Detection
     edges = cv2.Canny(gray, 30, 120)
     edges = cv2.dilate(edges, kernel_small, iterations=1)
     edges = cv2.erode(edges, kernel_small, iterations=1)
 
     contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    add_candidates_from_contours(
-        contours,
-        candidates,
-        image_area,
-        weight=1.35,
-        limit=15,
-    )
+    add_candidates_from_contours(contours, candidates, image_area, weight=1.35, limit=15)
 
     early = maybe_exit("edge_bilateral_early")
     if early:
         return early
 
-    # Method 2: Background Mask
     bg_mask = background_color_mask(resized)
     bg_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (41, 25))
 
@@ -245,20 +234,12 @@ def find_card_quad(image: np.ndarray) -> Tuple[Optional[np.ndarray], float, str]
     bg_mask = cv2.dilate(bg_mask, kernel_small, iterations=2)
 
     contours, _ = cv2.findContours(bg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    add_candidates_from_contours(
-        contours,
-        candidates,
-        image_area,
-        weight=1.25,
-        limit=15,
-    )
+    add_candidates_from_contours(contours, candidates, image_area, weight=1.25, limit=15)
 
     early = maybe_exit("background_mask_early")
     if early:
         return early
 
-    # Method 3: Saturation Mask
     saturation = hsv[:, :, 1]
     value = hsv[:, :, 2]
 
@@ -271,20 +252,12 @@ def find_card_quad(image: np.ndarray) -> Tuple[Optional[np.ndarray], float, str]
     card_mask = cv2.dilate(card_mask, kernel_small, iterations=2)
 
     contours, _ = cv2.findContours(card_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    add_candidates_from_contours(
-        contours,
-        candidates,
-        image_area,
-        weight=1.15,
-        limit=15,
-    )
+    add_candidates_from_contours(contours, candidates, image_area, weight=1.15, limit=15)
 
     early = maybe_exit("saturation_mask_early")
     if early:
         return early
 
-    # Method 4: Adaptive Threshold
     adaptive = cv2.adaptiveThreshold(
         gray,
         255,
@@ -297,14 +270,7 @@ def find_card_quad(image: np.ndarray) -> Tuple[Optional[np.ndarray], float, str]
     adaptive = cv2.morphologyEx(adaptive, cv2.MORPH_CLOSE, kernel_big, iterations=2)
 
     contours, _ = cv2.findContours(adaptive, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    add_candidates_from_contours(
-        contours,
-        candidates,
-        image_area,
-        weight=0.9,
-        limit=15,
-    )
+    add_candidates_from_contours(contours, candidates, image_area, weight=0.9, limit=15)
 
     best = best_candidate(candidates)
 
@@ -320,6 +286,7 @@ def find_card_quad_any_rotation(
 ) -> Tuple[Optional[np.ndarray], float, str, np.ndarray, int]:
     results = []
 
+    # Trước crop: được thử đủ 4 hướng
     for angle in (0, 90, 180, 270):
         rotated = rotate_image(image, angle)
         quad, score, method = find_card_quad(rotated)
@@ -384,17 +351,8 @@ def qr_position_score(image: np.ndarray) -> float:
 def red_emblem_score(image: np.ndarray) -> float:
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
 
-    red1 = cv2.inRange(
-        hsv,
-        np.array([0, 70, 60]),
-        np.array([12, 255, 255]),
-    )
-    red2 = cv2.inRange(
-        hsv,
-        np.array([165, 70, 60]),
-        np.array([179, 255, 255]),
-    )
-
+    red1 = cv2.inRange(hsv, np.array([0, 70, 60]), np.array([12, 255, 255]))
+    red2 = cv2.inRange(hsv, np.array([165, 70, 60]), np.array([179, 255, 255]))
     red = cv2.bitwise_or(red1, red2)
 
     h, w = red.shape
@@ -428,7 +386,7 @@ def bottom_text_score(image: np.ndarray) -> float:
 def mrz_score(image: np.ndarray) -> float:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
-    h, w = gray.shape
+    h, _ = gray.shape
 
     top = gray[: int(h * 0.45), :]
     bottom = gray[int(h * 0.52):, :]
@@ -462,21 +420,19 @@ def normalize_card_orientation(
 
     candidates = []
 
-    for angle in (0, 90, 180, 270):
+    # Sau khi warp, ảnh CCCD đã là khung ngang.
+    # Chỉ xét 0 và 180. Tuyệt đối không xoay 90/270 ở bước này.
+    for angle in (0, 180):
         rotated = rotate_image(image, angle)
 
-        h, w = rotated.shape[:2]
-        landscape_bonus = 5.0 if w >= h else -8.0
-
         if side == "back":
-            score = mrz_score(rotated) + landscape_bonus
+            score = mrz_score(rotated)
 
         elif side == "front":
             score = (
                 qr_position_score(rotated)
                 + red_emblem_score(rotated)
                 + bottom_text_score(rotated)
-                + landscape_bonus
             )
 
         else:
@@ -485,7 +441,6 @@ def normalize_card_orientation(
                 + red_emblem_score(rotated)
                 + bottom_text_score(rotated)
                 + mrz_score(rotated) * 0.4
-                + landscape_bonus
             )
 
         candidates.append((score, angle, rotated))
