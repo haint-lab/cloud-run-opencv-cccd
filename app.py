@@ -37,20 +37,21 @@ def encode_jpg(image: np.ndarray) -> str:
 
 def order_points(points: np.ndarray) -> np.ndarray:
     pts = points.reshape(4, 2).astype("float32")
-    ordered = np.zeros((4, 2), dtype="float32")
+
+    center = np.mean(pts, axis=0)
+    angles = np.arctan2(pts[:, 1] - center[1], pts[:, 0] - center[0])
+    pts = pts[np.argsort(angles)]
 
     s = pts.sum(axis=1)
-    ordered[0] = pts[np.argmin(s)]
-    ordered[2] = pts[np.argmax(s)]
-
-    diff = np.diff(pts, axis=1)
-    ordered[1] = pts[np.argmin(diff)]
-    ordered[3] = pts[np.argmax(diff)]
+    start = int(np.argmin(s))
+    ordered = np.roll(pts, -start, axis=0)
 
     top_width = np.linalg.norm(ordered[1] - ordered[0])
+    bottom_width = np.linalg.norm(ordered[2] - ordered[3])
     right_height = np.linalg.norm(ordered[2] - ordered[1])
+    left_height = np.linalg.norm(ordered[3] - ordered[0])
 
-    if top_width < right_height:
+    if (top_width + bottom_width) < (right_height + left_height):
         ordered = np.array(
             [ordered[3], ordered[0], ordered[1], ordered[2]],
             dtype="float32",
@@ -72,13 +73,17 @@ def contour_score(points: np.ndarray, image_area: float) -> float:
     aspect = max(width, height) / min(width, height)
     aspect_error = abs(aspect - CCCD_ASPECT) / CCCD_ASPECT
     area_ratio = area / image_area
+    rect_area = width * height
+    extent = area / rect_area if rect_area > 0 else 0
 
-    if area_ratio < 0.08 or area_ratio > 0.95:
+    if area_ratio < 0.06 or area_ratio > 0.96:
         return -1
     if aspect_error > 0.45:
         return -1
+    if extent < 0.55:
+        return -1
 
-    return area_ratio * 5.0 - aspect_error * 2.0
+    return area_ratio * 5.0 + extent * 1.2 - aspect_error * 2.5
 
 
 def expand_quad(points: np.ndarray, factor: float, width: int, height: int) -> np.ndarray:
@@ -103,59 +108,137 @@ def background_color_mask(image: np.ndarray) -> np.ndarray:
         ]
     )
     background = np.median(samples, axis=0).astype("float32")
-    diff = np.linalg.norm(image.astype("float32") - background, axis=2)
+    diff_bgr = np.linalg.norm(image.astype("float32") - background, axis=2)
+
+    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB).astype("float32")
+    bg_lab = cv2.cvtColor(background.reshape(1, 1, 3).astype("uint8"), cv2.COLOR_BGR2LAB)
+    diff_lab = np.linalg.norm(lab - bg_lab.reshape(1, 1, 3).astype("float32"), axis=2)
+    diff = np.maximum(diff_bgr, diff_lab)
 
     mask = np.zeros((h, w), dtype=np.uint8)
-    mask[diff > 28] = 255
+    diff_u8 = np.clip(diff, 0, 255).astype("uint8")
+    _, otsu = cv2.threshold(diff_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    mask[(diff > 18) | (otsu > 0)] = 255
     return mask
 
 
-def find_card_quad(image: np.ndarray) -> Optional[np.ndarray]:
-    ratio = image.shape[0] / 700.0
-    resized = cv2.resize(image, (int(image.shape[1] / ratio), 700))
+def resize_for_detection(image: np.ndarray, target_long_side: int = 1000) -> tuple[np.ndarray, float]:
+    h, w = image.shape[:2]
+    long_side = max(h, w)
+    if long_side <= target_long_side:
+        return image.copy(), 1.0
+
+    ratio = long_side / float(target_long_side)
+    resized = cv2.resize(image, (int(w / ratio), int(h / ratio)), interpolation=cv2.INTER_AREA)
+    return resized, ratio
+
+
+def keep_largest_components(mask: np.ndarray, max_components: int = 3) -> np.ndarray:
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+    if count <= 1:
+        return mask
+
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    indexes = np.argsort(areas)[::-1][:max_components] + 1
+    kept = np.zeros_like(mask)
+    for idx in indexes:
+        kept[labels == idx] = 255
+    return kept
+
+
+def add_contour_candidates(
+    candidates: list[tuple[float, np.ndarray]],
+    contours,
+    image_area: float,
+    weight: float = 1.0,
+) -> None:
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)
+
+    for contour in contours[:45]:
+        if cv2.contourArea(contour) < image_area * 0.015:
+            continue
+
+        perimeter = cv2.arcLength(contour, True)
+        if perimeter <= 0:
+            continue
+
+        hull = cv2.convexHull(contour)
+        approx = cv2.approxPolyDP(hull, 0.025 * perimeter, True)
+
+        if len(approx) == 4 and cv2.isContourConvex(approx):
+            points = approx.reshape(4, 2).astype("float32")
+            score = contour_score(points, image_area)
+            if score >= 0:
+                candidates.append((score * 1.08 * weight, points))
+
+        rect = cv2.boxPoints(cv2.minAreaRect(contour)).astype("float32")
+        score = contour_score(rect, image_area)
+        if score >= 0:
+            candidates.append((score * weight, rect))
+
+
+def rotate_points_to_original(
+    points: np.ndarray,
+    angle: int,
+    original_width: int,
+    original_height: int,
+) -> np.ndarray:
+    pts = points.reshape(4, 2).astype("float32")
+    mapped = np.zeros_like(pts)
+
+    if angle == 0:
+        return pts
+    if angle == 90:
+        mapped[:, 0] = pts[:, 1]
+        mapped[:, 1] = original_height - 1 - pts[:, 0]
+        return mapped
+    if angle == 180:
+        mapped[:, 0] = original_width - 1 - pts[:, 0]
+        mapped[:, 1] = original_height - 1 - pts[:, 1]
+        return mapped
+    if angle == 270:
+        mapped[:, 0] = original_width - 1 - pts[:, 1]
+        mapped[:, 1] = pts[:, 0]
+        return mapped
+
+    return pts
+
+
+def find_card_quad_single_orientation(image: np.ndarray) -> Optional[tuple[float, np.ndarray]]:
+    resized, ratio = resize_for_detection(image)
     image_area = resized.shape[0] * resized.shape[1]
 
     hsv = cv2.cvtColor(resized, cv2.COLOR_BGR2HSV)
     gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(gray, 50, 150)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    gray_eq = clahe.apply(gray)
+    blur = cv2.GaussianBlur(gray_eq, (5, 5), 0)
+    edges = cv2.Canny(blur, 35, 120)
 
     candidates = []
     kernel_small = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-    kernel_big = cv2.getStructuringElement(cv2.MORPH_RECT, (35, 21))
-
-    def add_candidates_from_contours(contours, weight=1.0):
-        contours = sorted(contours, key=cv2.contourArea, reverse=True)
-
-        for contour in contours[:30]:
-            perimeter = cv2.arcLength(contour, True)
-            approx = cv2.approxPolyDP(contour, 0.02 * perimeter, True)
-
-            if len(approx) == 4 and cv2.isContourConvex(approx):
-                points = approx.reshape(4, 2).astype("float32")
-                score = contour_score(points, image_area)
-                if score >= 0:
-                    candidates.append((score * weight, points))
-
-            rect = cv2.boxPoints(cv2.minAreaRect(contour)).astype("float32")
-            score = contour_score(rect, image_area)
-            if score >= 0:
-                candidates.append((score * 0.85 * weight, rect))
+    kernel_medium = cv2.getStructuringElement(cv2.MORPH_RECT, (17, 17))
+    kernel_big = cv2.getStructuringElement(cv2.MORPH_RECT, (47, 31))
 
     # Method 0: background subtraction from corner colors. This is useful when
-    # the card sits on a white sheet/table and the outer border is weak.
+    # the card sits on a white sheet/table and rounded corners weaken the border.
     bg_mask = background_color_mask(resized)
-    bg_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (41, 25))
     bg_mask = cv2.morphologyEx(bg_mask, cv2.MORPH_OPEN, kernel_small, iterations=1)
-    bg_mask = cv2.morphologyEx(bg_mask, cv2.MORPH_CLOSE, bg_kernel, iterations=4)
-    bg_mask = cv2.dilate(bg_mask, kernel_small, iterations=2)
+    bg_mask = cv2.morphologyEx(bg_mask, cv2.MORPH_CLOSE, kernel_big, iterations=3)
+    bg_mask = cv2.dilate(bg_mask, kernel_medium, iterations=1)
+    bg_mask = keep_largest_components(bg_mask)
     contours, _ = cv2.findContours(bg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    add_candidates_from_contours(contours, weight=1.45)
+    add_contour_candidates(candidates, contours, image_area, weight=1.55)
 
     # Method 1: normal border/edge detection. Works well when the card border
     # contrasts with the background.
+    edges_closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel_big, iterations=2)
+    edges_closed = cv2.dilate(edges_closed, kernel_small, iterations=1)
+    contours, _ = cv2.findContours(edges_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    add_contour_candidates(candidates, contours, image_area, weight=1.0)
+
     contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    add_candidates_from_contours(contours, weight=1.0)
+    add_contour_candidates(candidates, contours, image_area, weight=0.75)
 
     # Method 2: saturation mask. This helps when the card sits on a white
     # background and the outer edge is weak, but the CCCD artwork/text is colored.
@@ -167,30 +250,53 @@ def find_card_quad(image: np.ndarray) -> Optional[np.ndarray]:
 
     card_mask = cv2.morphologyEx(card_mask, cv2.MORPH_OPEN, kernel_small, iterations=1)
     card_mask = cv2.morphologyEx(card_mask, cv2.MORPH_CLOSE, kernel_big, iterations=3)
-    card_mask = cv2.dilate(card_mask, kernel_small, iterations=2)
+    card_mask = cv2.dilate(card_mask, kernel_medium, iterations=1)
+    card_mask = keep_largest_components(card_mask)
 
     contours, _ = cv2.findContours(card_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    add_candidates_from_contours(contours, weight=1.2)
+    add_contour_candidates(candidates, contours, image_area, weight=1.25)
 
     # Method 3: adaptive threshold for low-contrast photos.
     adaptive = cv2.adaptiveThreshold(
-        gray,
+        gray_eq,
         255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY_INV,
-        31,
+        35,
         5,
     )
     adaptive = cv2.morphologyEx(adaptive, cv2.MORPH_CLOSE, kernel_big, iterations=2)
+    adaptive = keep_largest_components(adaptive)
     contours, _ = cv2.findContours(adaptive, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    add_candidates_from_contours(contours, weight=0.9)
+    add_contour_candidates(candidates, contours, image_area, weight=0.9)
 
     if candidates:
         candidates.sort(key=lambda item: item[0], reverse=True)
         best = expand_quad(candidates[0][1], 1.03, resized.shape[1], resized.shape[0])
-        return best * ratio
+        return candidates[0][0], best * ratio
 
     return None
+
+
+def find_card_quad(image: np.ndarray) -> Optional[np.ndarray]:
+    h, w = image.shape[:2]
+    candidates = []
+
+    for angle in (0, 90, 180, 270):
+        rotated = rotate_image(image, angle)
+        result = find_card_quad_single_orientation(rotated)
+        if result is None:
+            continue
+
+        score, quad = result
+        mapped = rotate_points_to_original(quad, angle, w, h)
+        candidates.append((score, mapped))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
 
 
 def warp_card(image: np.ndarray, quad: np.ndarray) -> np.ndarray:
@@ -253,16 +359,50 @@ def qr_position_score(image: np.ndarray) -> float:
 
 def bottom_text_score(image: np.ndarray) -> float:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    dark = cv2.inRange(gray, 0, 105)
+    dark = cv2.inRange(gray, 0, 120)
 
     h, w = dark.shape
-    top = dark[: int(h * 0.35), :]
-    bottom = dark[int(h * 0.55) :, :]
+    top = dark[: int(h * 0.40), :]
+    bottom = dark[int(h * 0.52) :, :]
 
     top_density = cv2.countNonZero(top) / max(1, top.size)
     bottom_density = cv2.countNonZero(bottom) / max(1, bottom.size)
 
     return (bottom_density - top_density) * 30.0
+
+
+def mrz_score(image: np.ndarray) -> float:
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    dark = cv2.inRange(gray, 0, 135)
+
+    h, w = dark.shape
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(15, w // 28), 3))
+    rows = cv2.morphologyEx(dark, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+    top = rows[: int(h * 0.38), int(w * 0.05) : int(w * 0.95)]
+    bottom = rows[int(h * 0.58) :, int(w * 0.05) : int(w * 0.95)]
+
+    top_density = cv2.countNonZero(top) / max(1, top.size)
+    bottom_density = cv2.countNonZero(bottom) / max(1, bottom.size)
+
+    return (bottom_density - top_density) * 55.0
+
+
+def red_header_score(image: np.ndarray) -> float:
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    red1 = cv2.inRange(hsv, np.array([0, 55, 45]), np.array([14, 255, 255]))
+    red2 = cv2.inRange(hsv, np.array([163, 55, 45]), np.array([179, 255, 255]))
+    red = cv2.bitwise_or(red1, red2)
+
+    h, w = red.shape
+    upper = red[: int(h * 0.48), int(w * 0.08) : int(w * 0.92)]
+    lower = red[int(h * 0.52) :, int(w * 0.08) : int(w * 0.92)]
+
+    upper_density = cv2.countNonZero(upper) / max(1, upper.size)
+    lower_density = cv2.countNonZero(lower) / max(1, lower.size)
+
+    return (upper_density - lower_density) * 35.0
 
 
 def red_emblem_score(image: np.ndarray) -> float:
@@ -290,7 +430,9 @@ def normalize_card_orientation(image: np.ndarray) -> tuple[np.ndarray, int, floa
         score = (
             qr_position_score(rotated)
             + bottom_text_score(rotated)
+            + mrz_score(rotated)
             + red_emblem_score(rotated)
+            + red_header_score(rotated)
         )
         candidates.append((score, angle, rotated))
 
