@@ -78,6 +78,26 @@ def find_card_quad(image: np.ndarray) -> Optional[np.ndarray]:
     gray = cv2.cvtColor(work, cv2.COLOR_BGR2GRAY)
     hsv = cv2.cvtColor(work, cv2.COLOR_BGR2HSV)
 
+    # First try the same simple contour method used by the local script.
+    # This path is intentionally conservative because it already worked on the user's machine.
+    local_ratio = image.shape[0] / 700.0
+    local_resized = cv2.resize(image, (int(image.shape[1] / local_ratio), 700))
+    local_gray = cv2.cvtColor(local_resized, cv2.COLOR_BGR2GRAY)
+    local_gray = cv2.GaussianBlur(local_gray, (5, 5), 0)
+    local_edges = cv2.Canny(local_gray, 50, 150)
+    local_contours, _ = cv2.findContours(
+        local_edges,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE,
+    )
+    local_contours = sorted(local_contours, key=cv2.contourArea, reverse=True)
+
+    for contour in local_contours[:10]:
+        perimeter = cv2.arcLength(contour, True)
+        approx = cv2.approxPolyDP(contour, 0.02 * perimeter, True)
+        if len(approx) == 4:
+            return approx.reshape(4, 2).astype("float32") * local_ratio
+
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     gray = clahe.apply(gray)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
