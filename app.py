@@ -76,6 +76,7 @@ def contour_score(poly: np.ndarray, area: float, image_area: float) -> float:
 def find_card_quad(image: np.ndarray) -> Optional[np.ndarray]:
     work, scale = resize_for_detection(image)
     gray = cv2.cvtColor(work, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(work, cv2.COLOR_BGR2HSV)
 
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     gray = clahe.apply(gray)
@@ -94,6 +95,24 @@ def find_card_quad(image: np.ndarray) -> Optional[np.ndarray]:
     edge_sets.append(cv2.bitwise_not(adaptive))
 
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
+    big_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (21, 21))
+
+    # CCCD backs are usually a bright, low-saturation rectangle on a darker table.
+    # This catches cases where edge detection misses the rounded card border.
+    bright_mask = cv2.inRange(hsv, np.array([0, 0, 105]), np.array([179, 95, 255]))
+    bright_mask = cv2.morphologyEx(bright_mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    bright_mask = cv2.morphologyEx(bright_mask, cv2.MORPH_CLOSE, big_kernel, iterations=2)
+    contours, _ = cv2.findContours(bright_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area <= 0:
+            continue
+
+        rect = cv2.boxPoints(cv2.minAreaRect(contour)).astype("float32")
+        score = contour_score(rect, area, image_area)
+        if score >= 0:
+            candidates.append((score * 1.25, rect))
 
     for edges in edge_sets:
         closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=2)
@@ -191,9 +210,12 @@ def crop_cccd():
         quad = find_card_quad(image)
 
         if quad is None:
-            cropped = fallback_center_crop(image)
-            method = "fallback_center_crop"
-            cropped = cv2.resize(cropped, (OUTPUT_WIDTH, OUTPUT_HEIGHT), interpolation=cv2.INTER_CUBIC)
+            return jsonify(
+                {
+                    "ok": False,
+                    "error": "Cannot find CCCD rectangle. Please retake the photo with all 4 card corners visible.",
+                }
+            ), 422
         else:
             cropped = warp_card(image, quad)
             method = "opencv_quad"
